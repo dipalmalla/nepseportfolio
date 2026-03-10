@@ -70,9 +70,12 @@ function getVerdict(scrip, gainPct) {
 
 let currentUser = null;
 let holdings    = [];
+let dividends   = []; // [{scrip, date, type, value, shares}]
+let watchlist   = []; // ["NABIL","EBL",...]
+let liveMarketData = {}; // cached full market map from last fetch
 let sectorChart = null;
 let refreshInterval = null;
-let authMode    = "login"; // "login" | "register"
+let authMode    = "login";
 
 onAuthStateChanged(auth, async user => {
   currentUser = user;
@@ -92,7 +95,6 @@ onAuthStateChanged(auth, async user => {
 
 async function saveHoldings() {
   if (!currentUser) return;
-  // Clean the holdings array — strip any undefined/null values Firestore can't handle
   const clean = holdings.map(h => ({
     scrip:     h.scrip     || "",
     qty:       Number(h.qty)       || 0,
@@ -101,13 +103,13 @@ async function saveHoldings() {
     prevClose: Number(h.prevClose) || 0,
     sector:    h.sector    || "Others",
   }));
-  // Always save to localStorage as a reliable backup
   try { localStorage.setItem("portfolio_" + currentUser.uid, JSON.stringify(clean)); } catch(e) {}
+  try { localStorage.setItem("dividends_"  + currentUser.uid, JSON.stringify(dividends)); } catch(e) {}
+  try { localStorage.setItem("watchlist_"  + currentUser.uid, JSON.stringify(watchlist)); } catch(e) {}
   try {
-    await setDoc(doc(db, "portfolios", currentUser.uid), { holdings: clean });
+    await setDoc(doc(db, "portfolios", currentUser.uid), { holdings: clean, dividends, watchlist });
   } catch(e) {
     console.error("Save failed:", e);
-    setStatus("⚠ Save failed — data saved locally, will sync when possible", "amber");
   }
 }
 async function loadHoldings() {
@@ -116,13 +118,12 @@ async function loadHoldings() {
   try {
     const snap = await getDoc(doc(db, "portfolios", currentUser.uid));
     if (snap.exists()) {
-      holdings = snap.data().holdings || [];
+      holdings  = snap.data().holdings  || [];
+      dividends = snap.data().dividends || [];
+      watchlist = snap.data().watchlist || [];
       loaded = true;
     }
-  } catch(e) {
-    console.error("Firestore load failed:", e);
-  }
-  // Fall back to localStorage if Firestore had no data or failed
+  } catch(e) { console.error("Firestore load failed:", e); }
   if (!loaded || holdings.length === 0) {
     try {
       const local = localStorage.getItem("portfolio_" + currentUser.uid);
@@ -130,9 +131,9 @@ async function loadHoldings() {
         const parsed = JSON.parse(local);
         if (Array.isArray(parsed) && parsed.length > 0) {
           holdings = parsed;
-          if (!loaded) setStatus("⚠ Loaded from local backup — cloud sync may be unavailable", "amber");
-          // Try to sync local data back to Firestore
-          saveHoldings();
+          try { const ld = localStorage.getItem("dividends_" + currentUser.uid); if (ld) dividends = JSON.parse(ld)||[]; } catch(e) {}
+          try { const lw = localStorage.getItem("watchlist_" + currentUser.uid); if (lw) watchlist = JSON.parse(lw)||[]; } catch(e) {}
+          if (!loaded) saveHoldings();
         }
       }
     } catch(e) {}
@@ -140,85 +141,127 @@ async function loadHoldings() {
   renderPortfolio();
 }
 
-// ── LTP fetcher — returns { ltp, prevClose } ──────────────────────────────────
-async function fetchLTPData(scrip) {
+// ── Helper: fetch with timeout (browser-compatible) ──────────────────────────
+function fetchWithTimeout(url, ms = 10000, options = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  return fetch(url, { ...options, signal: controller.signal })
+    .finally(() => clearTimeout(timer));
+}
 
-  // Source 1: nepseapi.surajrimal.dev — CompanyDetails endpoint
+// ── Bulk LTP fetch — ONE request for ALL stocks ───────────────────────────────
+async function fetchAllLTPs() {
+  // Source 1: nepseapi.surajrimal.dev/LiveMarket — returns all stocks in one call
   try {
-    const res  = await fetch(`https://nepseapi.surajrimal.dev/CompanyDetails?symbol=${scrip}`, {
-      signal: AbortSignal.timeout(10000),
+    const res  = await fetchWithTimeout("https://nepseapi.surajrimal.dev/LiveMarket", 12000, {
       headers: { "Accept": "application/json" }
     });
-    const data = await res.json();
-    // Response has lastTradedPrice / previousClose fields
-    const ltp  = parseFloat(data.lastTradedPrice || data.ltp || data.closePrice || 0);
-    const prev = parseFloat(data.previousClose   || data.prevClose || ltp);
-    if (ltp > 0) return { ltp, prevClose: prev };
-  } catch(e) {}
-
-  // Source 2: Official NEPSE via allorigins proxy
-  try {
-    const url  = `https://www.nepalstock.com/api/nots/securityDailyTradeStat/${scrip}`;
-    const res  = await fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`, {
-      signal: AbortSignal.timeout(10000)
-    });
-    const data = await res.json();
-    if (data && data.securityDailyTradeDto) {
-      const d    = data.securityDailyTradeDto;
-      const ltp  = parseFloat(d.lastTradedPrice  || d.closingPrice || 0);
-      const prev = parseFloat(d.previousClosingPrice || d.closingPrice || ltp);
-      if (ltp > 0) return { ltp, prevClose: prev };
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data) && data.length > 0) {
+        const map = {};
+        data.forEach(s => {
+          const sym = (s.symbol || s.scrip || "").toUpperCase();
+          if (!sym) return;
+          map[sym] = {
+            ltp:       parseFloat(s.lastTradedPrice || s.ltp || s.closePrice || 0),
+            prevClose: parseFloat(s.previousClosingPrice || s.previousClose || s.prevClose || s.lastTradedPrice || 0),
+          };
+        });
+        if (Object.keys(map).length > 0) return map;
+      }
     }
   } catch(e) {}
 
-  // Source 3: MeroLagani via corsproxy
+  // Source 2: nepseapi.surajrimal.dev/PriceVolume — alternate bulk endpoint
   try {
-    const url  = `https://merolagani.com/handlers/webrequesthandler.ashx?type=getCompanyDetail&symbol=${scrip}`;
-    const res  = await fetch(`https://corsproxy.io/?${encodeURIComponent(url)}`, {
-      signal: AbortSignal.timeout(8000)
+    const res  = await fetchWithTimeout("https://nepseapi.surajrimal.dev/PriceVolume", 12000, {
+      headers: { "Accept": "application/json" }
     });
-    const data = await res.json();
-    if (data && data.LastTradedPrice) {
-      const ltp  = parseFloat(data.LastTradedPrice.toString().replace(/,/g,""));
-      const prev = parseFloat((data.PreviousClose||data.LastTradedPrice).toString().replace(/,/g,""));
-      if (ltp > 0) return { ltp, prevClose: prev };
+    if (res.ok) {
+      const data = await res.json();
+      const list = Array.isArray(data) ? data : (data?.data || data?.stocks || []);
+      if (list.length > 0) {
+        const map = {};
+        list.forEach(s => {
+          const sym = (s.symbol || s.scrip || s.stockSymbol || "").toUpperCase();
+          if (!sym) return;
+          map[sym] = {
+            ltp:       parseFloat(s.lastTradedPrice || s.ltp || s.closePrice || s.close || 0),
+            prevClose: parseFloat(s.previousClosingPrice || s.previousClose || s.prevClose || s.previousClose || 0) || parseFloat(s.lastTradedPrice || 0),
+          };
+        });
+        if (Object.keys(map).length > 0) return map;
+      }
     }
   } catch(e) {}
 
-  return null;
+  // Source 3: Official NEPSE today's price list via allorigins
+  try {
+    const url  = "https://www.nepalstock.com/api/nots/nepse-data/todaysprice";
+    const res  = await fetchWithTimeout(`https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`, 12000);
+    if (res.ok) {
+      const data = await res.json();
+      const list = data?.content || data?.data || (Array.isArray(data) ? data : []);
+      if (list.length > 0) {
+        const map = {};
+        list.forEach(s => {
+          const sym = (s.symbol || s.businessDate || "").toUpperCase();
+          if (!sym || sym.length > 12) return;
+          map[sym] = {
+            ltp:       parseFloat(s.lastTradedPrice || s.closingPrice || 0),
+            prevClose: parseFloat(s.previousClosingPrice || s.closingPrice || 0),
+          };
+        });
+        if (Object.keys(map).length > 0) return map;
+      }
+    }
+  } catch(e) {}
+
+  return null; // all sources failed
 }
 
-async function refreshAllLTPs(silent = false) {
+async function refreshAllLTPs() {
   if (holdings.length === 0) return;
-  let updated = 0;
-  let failed  = 0;
-  for (let h of holdings) {
-    const result = await fetchLTPData(h.scrip);
-    if (result) {
-      h.ltp       = result.ltp;
-      h.prevClose = result.prevClose;
-      updated++;
-    } else {
-      failed++;
-    }
-  }
-  await saveHoldings();
-  renderPortfolio();
-         savePortfolioHistory();
-drawPortfolioChart();
+
+  const el = document.getElementById("last-refresh");
+  el.textContent = "Updating prices…";
+  el.style.color = "#64748b";
+
+  const map = await fetchAllLTPs();
   const now = new Date();
   const timeStr = now.toLocaleTimeString("en-NP", { hour:"2-digit", minute:"2-digit" });
-  const el = document.getElementById("last-refresh");
-  if (updated > 0) {
-    el.textContent = `✓ Prices updated ${timeStr}`;
-    el.style.color = "#059669";
+
+  if (map) {
+    liveMarketData = map; // cache for live dashboard & watchlist
+    let updated = 0;
+    holdings.forEach(h => {
+      const d = map[h.scrip.toUpperCase()];
+      if (d && d.ltp > 0) {
+        h.ltp       = d.ltp;
+        h.prevClose = d.prevClose || d.ltp;
+        updated++;
+      }
+    });
+    await saveHoldings();
+    renderPortfolio();
+    renderLiveDashboard();
+    renderWatchlist();
+    if (updated > 0) {
+      el.textContent = `✓ Prices updated ${timeStr}`;
+      el.style.color = "#059669";
+    } else {
+      el.textContent = `Last updated ${timeStr} (market closed)`;
+      el.style.color = "#d97706";
+    }
   } else {
-    el.textContent = `⚠ Could not fetch prices — market may be closed`;
-    el.style.color = "#d97706";
+    renderPortfolio();
+    el.textContent = `⚠ Could not fetch prices — showing saved data`;
+    el.style.color = "#dc2626";
   }
 }
 
-function startAutoRefresh() { stopAutoRefresh(); refreshInterval = setInterval(() => refreshAllLTPs(true), 2*60*1000); }
+function startAutoRefresh() { stopAutoRefresh(); refreshInterval = setInterval(() => refreshAllLTPs(true), 5*60*1000); }
 function stopAutoRefresh()  { if (refreshInterval) clearInterval(refreshInterval); }
 
 // ── Auth actions ──────────────────────────────────────────────────────────────
@@ -348,13 +391,15 @@ window.saveHolding = async () => {
   }
   closeModal();
   if (!manualLTP) {
-    const result = await fetchLTPData(scrip);
-    const h = holdings.find(x => x.scrip === scrip);
-    if (result && h) { h.ltp = result.ltp; h.prevClose = result.prevClose; }
+    const map = await fetchAllLTPs();
+    const h   = holdings.find(x => x.scrip === scrip);
+    if (map && h && map[scrip]) {
+      h.ltp       = map[scrip].ltp;
+      h.prevClose = map[scrip].prevClose || map[scrip].ltp;
+    }
   }
   await saveHoldings();
   renderPortfolio();
-  setStatus("✓ Saved", "green");
 };
 
 window.deleteHolding = async (idx) => {
@@ -363,6 +408,308 @@ window.deleteHolding = async (idx) => {
   await saveHoldings();
   renderPortfolio();
 };
+
+// ── Dividend & Bonus System ───────────────────────────────────────────────────
+// dividend entry: { id, scrip, date, type, value, bonusPct, bonusShares }
+// type: "cash" | "bonus" | "right"
+
+window.openDivModal = (editId = null) => {
+  const scrips = [...new Set(holdings.map(h => h.scrip))].sort();
+  const sel    = document.getElementById("div-scrip");
+  sel.innerHTML = scrips.map(s => `<option value="${s}">${s}</option>`).join("");
+  document.getElementById("div-modal-title").textContent = editId ? "Edit Entry" : "Add Dividend / Bonus";
+  document.getElementById("div-edit-id").value = editId || "";
+  if (editId) {
+    const d = dividends.find(x => x.id === editId);
+    if (d) {
+      sel.value = d.scrip;
+      document.getElementById("div-date").value    = d.date   || "";
+      document.getElementById("div-type").value    = d.type   || "cash";
+      document.getElementById("div-value").value   = d.value  || "";
+      document.getElementById("div-bonus").value   = d.bonusPct || "";
+      toggleDivFields(d.type);
+    }
+  } else {
+    document.getElementById("div-date").value  = new Date().toISOString().slice(0,10);
+    document.getElementById("div-type").value  = "cash";
+    document.getElementById("div-value").value = "";
+    document.getElementById("div-bonus").value = "";
+    toggleDivFields("cash");
+  }
+  document.getElementById("div-modal").style.display = "flex";
+};
+window.closeDivModal = () => { document.getElementById("div-modal").style.display = "none"; };
+
+window.toggleDivFields = (type) => {
+  document.getElementById("div-value-group").style.display = type === "cash"  ? "block" : "none";
+  document.getElementById("div-bonus-group").style.display = type === "bonus" ? "block" : "none";
+  document.getElementById("div-right-info").style.display  = type === "right" ? "block" : "none";
+};
+
+window.saveDividend = async () => {
+  const scrip    = document.getElementById("div-scrip").value;
+  const date     = document.getElementById("div-date").value;
+  const type     = document.getElementById("div-type").value;
+  const value    = parseFloat(document.getElementById("div-value").value) || 0;
+  const bonusPct = parseFloat(document.getElementById("div-bonus").value) || 0;
+  const editId   = document.getElementById("div-edit-id").value;
+  if (!scrip || !date) { alert("Please select scrip and date."); return; }
+
+  const holding  = holdings.find(h => h.scrip === scrip);
+  const qty      = holding ? holding.qty : 0;
+  let bonusShares = 0;
+  if (type === "bonus" && bonusPct > 0 && qty > 0) {
+    bonusShares = Math.floor(qty * bonusPct / 100);
+  }
+
+  if (editId) {
+    const idx = dividends.findIndex(x => x.id === editId);
+    if (idx >= 0) dividends[idx] = { id: editId, scrip, date, type, value, bonusPct, bonusShares };
+  } else {
+    dividends.push({ id: Date.now().toString(), scrip, date, type, value, bonusPct, bonusShares });
+  }
+  closeDivModal();
+  await saveHoldings();
+  renderDividends();
+};
+
+window.deleteDividend = async (id) => {
+  if (!confirm("Remove this entry?")) return;
+  dividends = dividends.filter(d => d.id !== id);
+  await saveHoldings();
+  renderDividends();
+};
+
+function getDivSummary() {
+  // Per scrip: totalCashDiv, totalBonusShares, adjustedQty, totalReturn
+  const summary = {};
+  holdings.forEach(h => {
+    summary[h.scrip] = { scrip: h.scrip, cashDiv: 0, bonusShares: 0, rightEntries: 0 };
+  });
+  dividends.forEach(d => {
+    if (!summary[d.scrip]) summary[d.scrip] = { scrip: d.scrip, cashDiv: 0, bonusShares: 0, rightEntries: 0 };
+    if (d.type === "cash")  summary[d.scrip].cashDiv     += (d.value || 0);
+    if (d.type === "bonus") summary[d.scrip].bonusShares += (d.bonusShares || 0);
+    if (d.type === "right") summary[d.scrip].rightEntries++;
+  });
+  return summary;
+}
+
+function renderDividends() {
+  const summary  = getDivSummary();
+  const totalDiv = dividends.filter(d=>d.type==="cash").reduce((s,d)=>{
+    const h = holdings.find(x=>x.scrip===d.scrip);
+    return s + (d.value||0) * (h ? h.qty : 0);
+  }, 0);
+  const totalBonus = Object.values(summary).reduce((s,x)=>s+x.bonusShares,0);
+
+  document.getElementById("div-stat-cash").textContent   = "Rs. " + fmt(totalDiv);
+  document.getElementById("div-stat-bonus").textContent  = totalBonus + " shares";
+  document.getElementById("div-stat-count").textContent  = dividends.length + " entries";
+
+  // Render history table
+  const tbody = document.getElementById("div-tbody");
+  tbody.innerHTML = "";
+  if (dividends.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;padding:40px;color:#94a3b8">
+      <div style="font-size:28px;margin-bottom:8px">💰</div>
+      No dividends recorded yet. Click "+ Add Dividend / Bonus" to get started.
+    </td></tr>`;
+    return;
+  }
+  [...dividends].sort((a,b)=>b.date.localeCompare(a.date)).forEach(d => {
+    const h      = holdings.find(x => x.scrip === d.scrip);
+    const qty    = h ? h.qty : "—";
+    let   detail = "—", amount = "—";
+    if (d.type === "cash") {
+      detail = `Rs. ${d.value} per share`;
+      amount = h ? `Rs. ${fmt(d.value * h.qty)}` : "—";
+    } else if (d.type === "bonus") {
+      detail = `${d.bonusPct}% bonus`;
+      amount = `+${d.bonusShares} shares`;
+    } else if (d.type === "right") {
+      detail = "Right share offer";
+      amount = "—";
+    }
+    const typeCfg = {
+      cash:  { bg:"#dcfce7", color:"#15803d", label:"Cash Div" },
+      bonus: { bg:"#dbeafe", color:"#1d4ed8", label:"Bonus"    },
+      right: { bg:"#fef3c7", color:"#b45309", label:"Right"    },
+    }[d.type];
+    tbody.innerHTML += `<tr>
+      <td style="font-weight:700;color:#0f172a">${d.scrip}</td>
+      <td style="color:#64748b">${d.date}</td>
+      <td><span style="background:${typeCfg.bg};color:${typeCfg.color};padding:2px 10px;border-radius:20px;font-size:11px;font-weight:700">${typeCfg.label}</span></td>
+      <td style="color:#334155">${detail}</td>
+      <td style="font-weight:700;color:#059669">${amount}</td>
+      <td style="color:#64748b">${qty} shares held</td>
+      <td>
+        <button onclick="openDivModal('${d.id}')" class="icon-btn" title="Edit">✏️</button>
+        <button onclick="deleteDividend('${d.id}')" class="icon-btn" title="Delete">🗑️</button>
+      </td>
+    </tr>`;
+  });
+
+  // Render per-stock summary
+  const sumDiv = document.getElementById("div-summary-body");
+  sumDiv.innerHTML = "";
+  holdings.forEach(h => {
+    const s    = summary[h.scrip];
+    if (!s) return;
+    const totalCash  = s.cashDiv * h.qty;
+    const adjQty     = h.qty + s.bonusShares;
+    const currentVal = adjQty * (h.ltp || 0);
+    sumDiv.innerHTML += `<tr>
+      <td style="font-weight:700;color:#0f172a">${h.scrip}</td>
+      <td>${h.qty.toLocaleString()} + <span style="color:#1d4ed8;font-weight:600">${s.bonusShares}</span> bonus = <strong>${adjQty.toLocaleString()}</strong></td>
+      <td style="color:#059669;font-weight:600">${totalCash > 0 ? "Rs. "+fmt(totalCash) : "—"}</td>
+      <td style="color:#1d4ed8;font-weight:600">${s.bonusShares > 0 ? "+"+s.bonusShares+" shares" : "—"}</td>
+      <td style="font-weight:700">Rs. ${fmt(currentVal)}</td>
+    </tr>`;
+  });
+}
+
+// ── Live Market Dashboard ─────────────────────────────────────────────────────
+function renderLiveDashboard() {
+  const map = liveMarketData;
+  const stocks = Object.entries(map).map(([sym, d]) => ({
+    sym,
+    ltp:      d.ltp,
+    prev:     d.prevClose || d.ltp,
+    change:   d.ltp - (d.prevClose || d.ltp),
+    changePct: d.prevClose > 0 ? ((d.ltp - d.prevClose) / d.prevClose * 100) : 0,
+    volume:   d.volume || 0,
+    turnover: d.turnover || 0,
+  })).filter(s => s.ltp > 0);
+
+  if (stocks.length === 0) {
+    document.getElementById("live-gainers").innerHTML = emptyLiveMsg("Market data not available. Click ⟳ Refresh to load.");
+    document.getElementById("live-losers").innerHTML  = "";
+    document.getElementById("live-active").innerHTML  = "";
+    return;
+  }
+
+  const gainers  = [...stocks].sort((a,b) => b.changePct - a.changePct).slice(0, 10);
+  const losers   = [...stocks].sort((a,b) => a.changePct - b.changePct).slice(0, 10);
+  const active   = [...stocks].sort((a,b) => b.turnover - a.turnover).slice(0, 10);
+
+  document.getElementById("live-count").textContent  = stocks.length + " stocks";
+  const gainCount = stocks.filter(s => s.change > 0).length;
+  const lossCount = stocks.filter(s => s.change < 0).length;
+  const flatCount = stocks.filter(s => s.change === 0).length;
+  document.getElementById("live-breadth").innerHTML =
+    `<span style="color:#059669">▲ ${gainCount} up</span> &nbsp;
+     <span style="color:#dc2626">▼ ${lossCount} down</span> &nbsp;
+     <span style="color:#94a3b8">— ${flatCount} flat</span>`;
+
+  document.getElementById("live-gainers").innerHTML = gainers.map(s => liveCard(s, true)).join("");
+  document.getElementById("live-losers").innerHTML  = losers.map(s => liveCard(s, false)).join("");
+  document.getElementById("live-active").innerHTML  = active.map(s => turnoverCard(s)).join("");
+}
+
+function emptyLiveMsg(msg) {
+  return `<div style="text-align:center;padding:40px;color:#94a3b8;font-size:13px">
+    <div style="font-size:28px;margin-bottom:8px">📡</div>${msg}</div>`;
+}
+
+function liveCard(s, isGain) {
+  const color = s.change >= 0 ? "#059669" : "#dc2626";
+  const bg    = s.change >= 0 ? "#f0fdf4" : "#fef2f2";
+  const arrow = s.change > 0 ? "▲" : s.change < 0 ? "▼" : "—";
+  const inPortfolio = holdings.some(h => h.scrip === s.sym);
+  const inWatchlist = watchlist.includes(s.sym);
+  return `<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid #f1f5f9;gap:8px">
+    <div style="display:flex;align-items:center;gap:8px;min-width:0">
+      <span style="font-weight:700;color:#0f172a;font-size:13px;white-space:nowrap">${s.sym}</span>
+      ${inPortfolio ? '<span title="In portfolio" style="font-size:10px;background:#dbeafe;color:#1d4ed8;padding:1px 6px;border-radius:10px;font-weight:700">P</span>' : ""}
+      ${inWatchlist ? '<span title="In watchlist" style="font-size:10px;background:#fef3c7;color:#b45309;padding:1px 6px;border-radius:10px;font-weight:700">W</span>' : ""}
+    </div>
+    <div style="text-align:right;flex-shrink:0">
+      <div style="font-weight:700;color:#0f172a;font-size:13px">Rs. ${fmt(s.ltp)}</div>
+      <div style="font-size:11px;color:${color};font-weight:600">${arrow} ${Math.abs(s.changePct).toFixed(2)}%</div>
+    </div>
+    <button onclick="toggleWatchlist('${s.sym}')" title="${inWatchlist ? 'Remove from watchlist':'Add to watchlist'}"
+      style="background:none;border:none;cursor:pointer;font-size:16px;padding:2px;flex-shrink:0">${inWatchlist ? "★" : "☆"}</button>
+  </div>`;
+}
+
+function turnoverCard(s) {
+  const color = s.change >= 0 ? "#059669" : "#dc2626";
+  const inPortfolio = holdings.some(h => h.scrip === s.sym);
+  const inWatchlist = watchlist.includes(s.sym);
+  const tStr = s.turnover > 1e7 ? (s.turnover/1e7).toFixed(1)+" Cr" :
+               s.turnover > 1e5 ? (s.turnover/1e5).toFixed(1)+" L" :
+               fmt(s.turnover);
+  return `<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid #f1f5f9;gap:8px">
+    <div style="display:flex;align-items:center;gap:8px;min-width:0">
+      <span style="font-weight:700;color:#0f172a;font-size:13px">${s.sym}</span>
+      ${inPortfolio ? '<span style="font-size:10px;background:#dbeafe;color:#1d4ed8;padding:1px 6px;border-radius:10px;font-weight:700">P</span>' : ""}
+    </div>
+    <div style="text-align:right;flex-shrink:0">
+      <div style="font-weight:700;color:#0f172a;font-size:13px">Rs. ${fmt(s.ltp)}</div>
+      <div style="font-size:11px;color:#6366f1;font-weight:600">Rs. ${tStr}</div>
+    </div>
+    <button onclick="toggleWatchlist('${s.sym}')" title="Watchlist"
+      style="background:none;border:none;cursor:pointer;font-size:16px;padding:2px;flex-shrink:0">${inWatchlist ? "★" : "☆"}</button>
+  </div>`;
+}
+
+// ── Watchlist ─────────────────────────────────────────────────────────────────
+window.toggleWatchlist = async (scrip) => {
+  if (watchlist.includes(scrip)) {
+    watchlist = watchlist.filter(s => s !== scrip);
+  } else {
+    watchlist.push(scrip);
+  }
+  await saveHoldings();
+  renderWatchlist();
+  renderLiveDashboard(); // refresh star buttons in live dashboard
+};
+
+window.addToWatchlist = async () => {
+  const input = document.getElementById("watchlist-input");
+  const scrip = input.value.trim().toUpperCase();
+  if (!scrip) return;
+  if (watchlist.includes(scrip)) { input.value = ""; return; }
+  watchlist.push(scrip);
+  input.value = "";
+  await saveHoldings();
+  renderWatchlist();
+};
+
+function renderWatchlist() {
+  const tbody = document.getElementById("watchlist-tbody");
+  if (!tbody) return;
+  tbody.innerHTML = "";
+  if (watchlist.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="6" style="text-align:center;padding:40px;color:#94a3b8">
+      <div style="font-size:28px;margin-bottom:8px">⭐</div>
+      No stocks in watchlist. Search for a scrip above or click ☆ in the Live Market tab.</td></tr>`;
+    return;
+  }
+  watchlist.forEach(scrip => {
+    const d    = liveMarketData[scrip.toUpperCase()];
+    const ltp  = d ? d.ltp : null;
+    const prev = d ? (d.prevClose || d.ltp) : null;
+    const chg  = (ltp && prev) ? ltp - prev : null;
+    const chgP = (chg && prev) ? (chg / prev * 100) : null;
+    const color = !chg ? "#64748b" : chg >= 0 ? "#059669" : "#dc2626";
+    const arrow = !chg ? "—" : chg > 0 ? "▲" : "▼";
+    const inPortfolio = holdings.some(h => h.scrip === scrip);
+    tbody.innerHTML += `<tr>
+      <td style="font-weight:700;color:#0f172a">${scrip}
+        ${inPortfolio ? '<span style="font-size:10px;background:#dbeafe;color:#1d4ed8;padding:1px 7px;border-radius:10px;font-weight:700;margin-left:4px">In Portfolio</span>' : ""}
+      </td>
+      <td style="font-weight:700">${ltp ? "Rs. "+fmt(ltp) : "—"}</td>
+      <td style="color:${color};font-weight:600">${chg ? (chg>=0?"+":"")+"Rs. "+fmt(Math.abs(chg)) : "—"}</td>
+      <td style="color:${color};font-weight:600">${chgP ? arrow+" "+Math.abs(chgP).toFixed(2)+"%" : "—"}</td>
+      <td style="color:#64748b;font-size:12px">${d ? "Live" : "Awaiting refresh"}</td>
+      <td>
+        <button onclick="toggleWatchlist('${scrip}')" class="icon-btn" style="color:#dc2626" title="Remove">✕ Remove</button>
+      </td>
+    </tr>`;
+  });
+}
 
 // ── Render ────────────────────────────────────────────────────────────────────
 function renderPortfolio() {
@@ -866,8 +1213,6 @@ window.confirmImport = async () => {
     .auth-wrap{grid-template-columns:1fr}
   }
 </style>
-
-         <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
 
@@ -1034,6 +1379,9 @@ window.confirmImport = async () => {
       <button class="tab-btn active" data-tab="holdings"  onclick="showTab('holdings')">📋 Holdings</button>
       <button class="tab-btn"        data-tab="sectors"   onclick="showTab('sectors')">🥧 Sectors</button>
       <button class="tab-btn"        data-tab="rebalance" onclick="showTab('rebalance')">⚖️ Rebalancing</button>
+      <button class="tab-btn"        data-tab="dividends" onclick="showTab('dividends');renderDividends()">💰 Dividends</button>
+      <button class="tab-btn"        data-tab="live"      onclick="showTab('live');renderLiveDashboard()">📡 Live Market</button>
+      <button class="tab-btn"        data-tab="watchlist" onclick="showTab('watchlist');renderWatchlist()">⭐ Watchlist</button>
     </div>
 
     <!-- Holdings Tab -->
@@ -1087,6 +1435,188 @@ window.confirmImport = async () => {
       </div>
     </div>
 
+    <!-- Dividends & Bonus Tab -->
+    <div class="tab-content" id="tab-dividends">
+
+      <!-- Summary stats -->
+      <div class="stats-grid" style="margin-bottom:20px">
+        <div class="stat-card">
+          <div class="stat-label">Total Cash Dividends</div>
+          <div class="stat-value" style="color:#059669" id="div-stat-cash">Rs. 0</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Total Bonus Shares</div>
+          <div class="stat-value" style="color:#1d4ed8" id="div-stat-bonus">0 shares</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Total Entries</div>
+          <div class="stat-value" style="color:#6366f1" id="div-stat-count">0 entries</div>
+        </div>
+      </div>
+
+      <!-- Add button -->
+      <div class="toolbar" style="margin-bottom:16px">
+        <button class="btn-primary" onclick="openDivModal()">+ Add Dividend / Bonus</button>
+        <span style="font-size:12px;color:var(--muted);margin-left:8px">Track cash dividends, bonus shares, and right share offers for each holding</span>
+      </div>
+
+      <!-- History table -->
+      <div class="table-wrap" style="margin-bottom:20px">
+        <table>
+          <thead><tr>
+            <th>Scrip</th><th>Date</th><th>Type</th><th>Details</th>
+            <th>Amount / Shares</th><th>Qty Held</th><th>Actions</th>
+          </tr></thead>
+          <tbody id="div-tbody"></tbody>
+        </table>
+      </div>
+
+      <!-- Per-stock adjusted summary -->
+      <div class="card">
+        <div class="card-title">Adjusted Holdings Summary — Including Bonus Shares</div>
+        <table style="width:100%;border-collapse:collapse;font-size:13px">
+          <thead><tr>
+            <th style="padding:10px 14px;text-align:left;font-size:11px;letter-spacing:.8px;text-transform:uppercase;color:var(--muted);font-weight:700;background:#f8fafc;border-bottom:1px solid var(--border)">Scrip</th>
+            <th style="padding:10px 14px;text-align:left;font-size:11px;letter-spacing:.8px;text-transform:uppercase;color:var(--muted);font-weight:700;background:#f8fafc;border-bottom:1px solid var(--border)">Adjusted Qty</th>
+            <th style="padding:10px 14px;text-align:left;font-size:11px;letter-spacing:.8px;text-transform:uppercase;color:var(--muted);font-weight:700;background:#f8fafc;border-bottom:1px solid var(--border)">Cash Received</th>
+            <th style="padding:10px 14px;text-align:left;font-size:11px;letter-spacing:.8px;text-transform:uppercase;color:var(--muted);font-weight:700;background:#f8fafc;border-bottom:1px solid var(--border)">Bonus Shares</th>
+            <th style="padding:10px 14px;text-align:left;font-size:11px;letter-spacing:.8px;text-transform:uppercase;color:var(--muted);font-weight:700;background:#f8fafc;border-bottom:1px solid var(--border)">Adjusted Value</th>
+          </tr></thead>
+          <tbody id="div-summary-body"></tbody>
+        </table>
+        <div style="margin-top:12px;font-size:12px;color:var(--muted);padding:0 14px 14px">
+          💡 Bonus shares increase your effective holding quantity. Cash dividends are added to your total return. This data is for your reference — update your actual holding qty manually after bonus share credit.
+        </div>
+      </div>
+    </div>
+
+    <!-- Live Market Tab -->
+    <div class="tab-content" id="tab-live">
+      <!-- Market breadth bar -->
+      <div class="stats-grid" style="margin-bottom:20px">
+        <div class="stat-card">
+          <div class="stat-label">Stocks Loaded</div>
+          <div class="stat-value" style="color:#6366f1;font-size:20px" id="live-count">—</div>
+        </div>
+        <div class="stat-card" style="grid-column:span 3">
+          <div class="stat-label">Market Breadth</div>
+          <div class="stat-value" style="font-size:16px;letter-spacing:.5px" id="live-breadth">—</div>
+        </div>
+      </div>
+
+      <!-- 3-column grid -->
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px">
+
+        <!-- Top Gainers -->
+        <div class="card" style="padding:0;overflow:hidden">
+          <div class="card-title" style="padding:14px 16px;margin:0;border-bottom:1px solid var(--border);background:#f0fdf4;color:#15803d">
+            ▲ Top Gainers
+          </div>
+          <div id="live-gainers">
+            <div style="text-align:center;padding:40px;color:#94a3b8;font-size:13px">
+              <div style="font-size:28px;margin-bottom:8px">📡</div>
+              Click ⟳ Refresh to load live prices
+            </div>
+          </div>
+        </div>
+
+        <!-- Top Losers -->
+        <div class="card" style="padding:0;overflow:hidden">
+          <div class="card-title" style="padding:14px 16px;margin:0;border-bottom:1px solid var(--border);background:#fef2f2;color:#b91c1c">
+            ▼ Top Losers
+          </div>
+          <div id="live-losers">
+            <div style="text-align:center;padding:40px;color:#94a3b8;font-size:13px">—</div>
+          </div>
+        </div>
+
+        <!-- Most Active by Turnover -->
+        <div class="card" style="padding:0;overflow:hidden">
+          <div class="card-title" style="padding:14px 16px;margin:0;border-bottom:1px solid var(--border);background:#f5f3ff;color:#6d28d9">
+            🔥 Most Active
+          </div>
+          <div id="live-active">
+            <div style="text-align:center;padding:40px;color:#94a3b8;font-size:13px">—</div>
+          </div>
+        </div>
+
+      </div>
+      <div style="margin-top:14px;font-size:12px;color:var(--muted);text-align:center">
+        ☆ = add to watchlist &nbsp;·&nbsp; P = in your portfolio &nbsp;·&nbsp; W = in your watchlist &nbsp;·&nbsp; Prices auto-update every 5 min
+      </div>
+    </div>
+
+    <!-- Watchlist Tab -->
+    <div class="tab-content" id="tab-watchlist">
+      <div class="toolbar" style="margin-bottom:16px;align-items:center">
+        <input id="watchlist-input" class="form-input" placeholder="Type scrip e.g. EBL" style="max-width:200px;margin:0"
+          onkeydown="if(event.key==='Enter') addToWatchlist()"
+          oninput="this.value=this.value.toUpperCase()"/>
+        <button class="btn-primary" onclick="addToWatchlist()">+ Add to Watchlist</button>
+        <span style="font-size:12px;color:var(--muted);margin-left:8px">Track any NEPSE stock — prices update with each refresh</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>Scrip</th><th>LTP</th><th>Change (Rs.)</th><th>Change (%)</th><th>Status</th><th>Actions</th>
+          </tr></thead>
+          <tbody id="watchlist-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- Dividend / Bonus Modal -->
+<div id="div-modal" style="display:none;position:fixed;inset:0;background:rgba(15,23,42,0.5);align-items:center;justify-content:center;z-index:200;padding:24px;backdrop-filter:blur(4px)">
+  <div class="modal-box" style="max-width:460px">
+    <div class="modal-title" id="div-modal-title">Add Dividend / Bonus</div>
+    <input type="hidden" id="div-edit-id"/>
+
+    <div class="form-group">
+      <label class="form-label">Stock (Scrip)</label>
+      <select id="div-scrip" class="form-input" style="cursor:pointer"></select>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Date</label>
+      <input id="div-date" class="form-input" type="date"/>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Type</label>
+      <select id="div-type" class="form-input" onchange="toggleDivFields(this.value)" style="cursor:pointer">
+        <option value="cash">💵 Cash Dividend</option>
+        <option value="bonus">🎁 Bonus Share</option>
+        <option value="right">📋 Right Share</option>
+      </select>
+    </div>
+
+    <!-- Cash dividend fields -->
+    <div id="div-value-group" class="form-group">
+      <label class="form-label">Dividend per Share (Rs.)</label>
+      <input id="div-value" class="form-input" type="number" step="0.01" placeholder="e.g. 25 for Rs. 25 per share"/>
+      <div class="form-hint">Enter the cash dividend amount per share (e.g. 25% dividend = Rs. 25 per share for Rs. 100 face value)</div>
+    </div>
+
+    <!-- Bonus share fields -->
+    <div id="div-bonus-group" class="form-group" style="display:none">
+      <label class="form-label">Bonus Percentage (%)</label>
+      <input id="div-bonus" class="form-input" type="number" step="0.01" placeholder="e.g. 15 for 15% bonus shares"/>
+      <div class="form-hint">Bonus shares will be calculated as: qty × bonus% ÷ 100 (rounded down)</div>
+    </div>
+
+    <!-- Right share info -->
+    <div id="div-right-info" class="form-group" style="display:none">
+      <div style="background:#fef3c7;border:1px solid #fde68a;border-radius:8px;padding:12px;font-size:12px;color:#92400e;line-height:1.7">
+        <strong>Right Share Offer recorded.</strong><br/>
+        This is a reminder entry. Update your actual holding quantity manually if you subscribed to the rights.
+      </div>
+    </div>
+
+    <div class="modal-actions">
+      <button class="modal-cancel" onclick="closeDivModal()">Cancel</button>
+      <button class="modal-save"   onclick="saveDividend()">Save</button>
+    </div>
   </div>
 </div>
 
