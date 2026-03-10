@@ -166,6 +166,12 @@ async function fetchAllLTPs() {
           map[sym] = {
             ltp:       parseFloat(s.lastTradedPrice || s.ltp || s.closePrice || 0),
             prevClose: parseFloat(s.previousClosingPrice || s.previousClose || s.prevClose || s.lastTradedPrice || 0),
+            open:      parseFloat(s.openPrice  || s.open  || 0),
+            high:      parseFloat(s.highPrice  || s.high  || 0),
+            low:       parseFloat(s.lowPrice   || s.low   || 0),
+            volume:    parseFloat(s.totalTradeQuantity || s.volume || s.qty || 0),
+            turnover:  parseFloat(s.totalTurnover || s.turnover || s.amount || 0),
+            trades:    parseFloat(s.totalTrades  || s.trades || 0),
           };
         });
         if (Object.keys(map).length > 0) return map;
@@ -188,7 +194,13 @@ async function fetchAllLTPs() {
           if (!sym) return;
           map[sym] = {
             ltp:       parseFloat(s.lastTradedPrice || s.ltp || s.closePrice || s.close || 0),
-            prevClose: parseFloat(s.previousClosingPrice || s.previousClose || s.prevClose || s.previousClose || 0) || parseFloat(s.lastTradedPrice || 0),
+            prevClose: parseFloat(s.previousClosingPrice || s.previousClose || s.prevClose || 0) || parseFloat(s.lastTradedPrice || 0),
+            open:      parseFloat(s.openPrice  || s.open  || 0),
+            high:      parseFloat(s.highPrice  || s.high  || 0),
+            low:       parseFloat(s.lowPrice   || s.low   || 0),
+            volume:    parseFloat(s.totalTradeQuantity || s.volume || 0),
+            turnover:  parseFloat(s.totalTurnover || s.turnover || 0),
+            trades:    parseFloat(s.totalTrades  || s.trades || 0),
           };
         });
         if (Object.keys(map).length > 0) return map;
@@ -196,21 +208,27 @@ async function fetchAllLTPs() {
     }
   } catch(e) {}
 
-  // Source 3: Official NEPSE today's price list via allorigins
+  // Source 3: Official NEPSE today's price list via allorigins (size=500 gets all stocks)
   try {
-    const url  = "https://www.nepalstock.com/api/nots/nepse-data/todaysprice";
-    const res  = await fetchWithTimeout(`https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`, 12000);
+    const url  = "https://www.nepalstock.com/api/nots/nepse-data/todaysprice?size=500&page=0";
+    const res  = await fetchWithTimeout(`https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`, 14000);
     if (res.ok) {
       const data = await res.json();
       const list = data?.content || data?.data || (Array.isArray(data) ? data : []);
       if (list.length > 0) {
         const map = {};
         list.forEach(s => {
-          const sym = (s.symbol || s.businessDate || "").toUpperCase();
+          const sym = (s.symbol || s.scrip || "").toUpperCase();
           if (!sym || sym.length > 12) return;
           map[sym] = {
-            ltp:       parseFloat(s.lastTradedPrice || s.closingPrice || 0),
+            ltp:       parseFloat(s.lastTradedPrice  || s.closingPrice || 0),
             prevClose: parseFloat(s.previousClosingPrice || s.closingPrice || 0),
+            open:      parseFloat(s.openPrice  || 0),
+            high:      parseFloat(s.highPrice  || 0),
+            low:       parseFloat(s.lowPrice   || 0),
+            volume:    parseFloat(s.totalTradeQuantity || s.totalQuantity || 0),
+            turnover:  parseFloat(s.totalTurnover || 0),
+            trades:    parseFloat(s.totalTrades  || 0),
           };
         });
         if (Object.keys(map).length > 0) return map;
@@ -569,89 +587,134 @@ function renderDividends() {
   });
 }
 
-// ── Live Market Dashboard ─────────────────────────────────────────────────────
+// ── Live Market Dashboard — ALL stocks, searchable + sortable ────────────────
+let liveSort = { col: "changePct", dir: -1 }; // default: top gainers first
+let liveSearch = "";
+let liveFilter = "all"; // all | up | down | portfolio | watchlist
+
+window.setLiveSearch = (v) => { liveSearch = v.toUpperCase(); renderLiveTable(); };
+window.setLiveFilter = (v) => {
+  liveFilter = v;
+  document.querySelectorAll(".live-filter-btn").forEach(b => b.classList.toggle("active", b.dataset.f === v));
+  renderLiveTable();
+};
+window.sortLive = (col) => {
+  if (liveSort.col === col) liveSort.dir *= -1;
+  else { liveSort.col = col; liveSort.dir = col === "sym" ? 1 : -1; }
+  document.querySelectorAll(".live-th").forEach(th => {
+    th.classList.toggle("sorted", th.dataset.col === col);
+    if (th.dataset.col === col) th.dataset.dir = liveSort.dir === 1 ? "asc" : "desc";
+  });
+  renderLiveTable();
+};
+
 function renderLiveDashboard() {
   const map = liveMarketData;
   const stocks = Object.entries(map).map(([sym, d]) => ({
     sym,
-    ltp:      d.ltp,
-    prev:     d.prevClose || d.ltp,
-    change:   d.ltp - (d.prevClose || d.ltp),
+    ltp:       d.ltp,
+    open:      d.open      || 0,
+    high:      d.high      || 0,
+    low:       d.low       || 0,
+    prev:      d.prevClose || d.ltp,
+    change:    d.ltp - (d.prevClose || d.ltp),
     changePct: d.prevClose > 0 ? ((d.ltp - d.prevClose) / d.prevClose * 100) : 0,
-    volume:   d.volume || 0,
-    turnover: d.turnover || 0,
+    volume:    d.volume    || 0,
+    turnover:  d.turnover  || 0,
+    trades:    d.trades    || 0,
   })).filter(s => s.ltp > 0);
 
+  const el = document.getElementById("live-empty");
+  const tbl = document.getElementById("live-table-wrap");
+
   if (stocks.length === 0) {
-    document.getElementById("live-gainers").innerHTML = emptyLiveMsg("Market data not available. Click ⟳ Refresh to load.");
-    document.getElementById("live-losers").innerHTML  = "";
-    document.getElementById("live-active").innerHTML  = "";
+    if (el)  el.style.display  = "block";
+    if (tbl) tbl.style.display = "none";
+    const statEl = document.getElementById("live-count");
+    if (statEl) statEl.textContent = "—";
     return;
   }
+  if (el)  el.style.display  = "none";
+  if (tbl) tbl.style.display = "block";
 
-  const gainers  = [...stocks].sort((a,b) => b.changePct - a.changePct).slice(0, 10);
-  const losers   = [...stocks].sort((a,b) => a.changePct - b.changePct).slice(0, 10);
-  const active   = [...stocks].sort((a,b) => b.turnover - a.turnover).slice(0, 10);
-
-  document.getElementById("live-count").textContent  = stocks.length + " stocks";
+  // Stats bar
   const gainCount = stocks.filter(s => s.change > 0).length;
   const lossCount = stocks.filter(s => s.change < 0).length;
   const flatCount = stocks.filter(s => s.change === 0).length;
-  document.getElementById("live-breadth").innerHTML =
-    `<span style="color:#059669">▲ ${gainCount} up</span> &nbsp;
-     <span style="color:#dc2626">▼ ${lossCount} down</span> &nbsp;
-     <span style="color:#94a3b8">— ${flatCount} flat</span>`;
+  const countEl   = document.getElementById("live-count");
+  const breadthEl = document.getElementById("live-breadth");
+  if (countEl)   countEl.textContent   = stocks.length + " stocks";
+  if (breadthEl) breadthEl.innerHTML   =
+    `<span style="color:#059669;font-weight:700">▲ ${gainCount}</span>&nbsp; up &nbsp;·&nbsp;
+     <span style="color:#dc2626;font-weight:700">▼ ${lossCount}</span>&nbsp; down &nbsp;·&nbsp;
+     <span style="color:#94a3b8;font-weight:700">— ${flatCount}</span>&nbsp; flat`;
 
-  document.getElementById("live-gainers").innerHTML = gainers.map(s => liveCard(s, true)).join("");
-  document.getElementById("live-losers").innerHTML  = losers.map(s => liveCard(s, false)).join("");
-  document.getElementById("live-active").innerHTML  = active.map(s => turnoverCard(s)).join("");
+  // Store for filtering/sorting
+  window._liveStocks = stocks;
+  renderLiveTable();
+}
+
+function renderLiveTable() {
+  const stocks = window._liveStocks || [];
+  if (!stocks.length) return;
+
+  // Filter
+  let filtered = stocks.filter(s => {
+    if (liveSearch && !s.sym.includes(liveSearch)) return false;
+    if (liveFilter === "up")        return s.change > 0;
+    if (liveFilter === "down")      return s.change < 0;
+    if (liveFilter === "portfolio") return holdings.some(h => h.scrip === s.sym);
+    if (liveFilter === "watchlist") return watchlist.includes(s.sym);
+    return true;
+  });
+
+  // Sort
+  filtered.sort((a, b) => {
+    const av = a[liveSort.col] ?? a.sym;
+    const bv = b[liveSort.col] ?? b.sym;
+    if (typeof av === "string") return av.localeCompare(bv) * liveSort.dir;
+    return (av - bv) * liveSort.dir;
+  });
+
+  const tbody = document.getElementById("live-tbody");
+  if (!tbody) return;
+
+  const fmtT = (t) => t > 1e7 ? (t/1e7).toFixed(2)+" Cr" : t > 1e5 ? (t/1e5).toFixed(1)+" L" : t > 0 ? fmt(t) : "—";
+
+  tbody.innerHTML = filtered.map(s => {
+    const color = s.change > 0 ? "#059669" : s.change < 0 ? "#dc2626" : "#94a3b8";
+    const bg    = s.change > 0 ? "rgba(5,150,105,0.06)" : s.change < 0 ? "rgba(220,38,38,0.06)" : "";
+    const arrow = s.change > 0 ? "▲" : s.change < 0 ? "▼" : "—";
+    const inP   = holdings.some(h => h.scrip === s.sym);
+    const inW   = watchlist.includes(s.sym);
+    return `<tr style="background:${bg}">
+      <td style="font-weight:700;color:#0f172a;white-space:nowrap">
+        ${s.sym}
+        ${inP ? '<span style="font-size:9px;background:#dbeafe;color:#1d4ed8;padding:1px 5px;border-radius:8px;font-weight:700;margin-left:3px">P</span>' : ""}
+        ${inW ? '<span style="font-size:9px;background:#fef3c7;color:#b45309;padding:1px 5px;border-radius:8px;font-weight:700;margin-left:2px">W</span>' : ""}
+      </td>
+      <td style="font-weight:700;text-align:right">${fmt(s.ltp)}</td>
+      <td style="color:${color};font-weight:700;text-align:right">${arrow} ${fmt(Math.abs(s.change))}</td>
+      <td style="color:${color};font-weight:700;text-align:right">${arrow} ${Math.abs(s.changePct).toFixed(2)}%</td>
+      <td style="text-align:right;color:#475569">${s.open > 0 ? fmt(s.open) : "—"}</td>
+      <td style="text-align:right;color:#059669;font-weight:600">${s.high > 0 ? fmt(s.high) : "—"}</td>
+      <td style="text-align:right;color:#dc2626;font-weight:600">${s.low  > 0 ? fmt(s.low)  : "—"}</td>
+      <td style="text-align:right;color:#64748b">${s.volume > 0 ? fmt(s.volume) : "—"}</td>
+      <td style="text-align:right;color:#6366f1;font-weight:600">${fmtT(s.turnover)}</td>
+      <td style="text-align:center">
+        <button onclick="toggleWatchlist('${s.sym}')" title="${inW?"Remove from watchlist":"Add to watchlist"}"
+          style="background:none;border:none;cursor:pointer;font-size:15px;line-height:1;padding:2px 4px;color:${inW?"#f59e0b":"#cbd5e1"}">${inW?"★":"☆"}</button>
+      </td>
+    </tr>`;
+  }).join("");
+
+  document.getElementById("live-result-count").textContent =
+    filtered.length === stocks.length ? `${stocks.length} stocks` : `${filtered.length} of ${stocks.length} stocks`;
 }
 
 function emptyLiveMsg(msg) {
   return `<div style="text-align:center;padding:40px;color:#94a3b8;font-size:13px">
     <div style="font-size:28px;margin-bottom:8px">📡</div>${msg}</div>`;
-}
-
-function liveCard(s, isGain) {
-  const color = s.change >= 0 ? "#059669" : "#dc2626";
-  const bg    = s.change >= 0 ? "#f0fdf4" : "#fef2f2";
-  const arrow = s.change > 0 ? "▲" : s.change < 0 ? "▼" : "—";
-  const inPortfolio = holdings.some(h => h.scrip === s.sym);
-  const inWatchlist = watchlist.includes(s.sym);
-  return `<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid #f1f5f9;gap:8px">
-    <div style="display:flex;align-items:center;gap:8px;min-width:0">
-      <span style="font-weight:700;color:#0f172a;font-size:13px;white-space:nowrap">${s.sym}</span>
-      ${inPortfolio ? '<span title="In portfolio" style="font-size:10px;background:#dbeafe;color:#1d4ed8;padding:1px 6px;border-radius:10px;font-weight:700">P</span>' : ""}
-      ${inWatchlist ? '<span title="In watchlist" style="font-size:10px;background:#fef3c7;color:#b45309;padding:1px 6px;border-radius:10px;font-weight:700">W</span>' : ""}
-    </div>
-    <div style="text-align:right;flex-shrink:0">
-      <div style="font-weight:700;color:#0f172a;font-size:13px">Rs. ${fmt(s.ltp)}</div>
-      <div style="font-size:11px;color:${color};font-weight:600">${arrow} ${Math.abs(s.changePct).toFixed(2)}%</div>
-    </div>
-    <button onclick="toggleWatchlist('${s.sym}')" title="${inWatchlist ? 'Remove from watchlist':'Add to watchlist'}"
-      style="background:none;border:none;cursor:pointer;font-size:16px;padding:2px;flex-shrink:0">${inWatchlist ? "★" : "☆"}</button>
-  </div>`;
-}
-
-function turnoverCard(s) {
-  const color = s.change >= 0 ? "#059669" : "#dc2626";
-  const inPortfolio = holdings.some(h => h.scrip === s.sym);
-  const inWatchlist = watchlist.includes(s.sym);
-  const tStr = s.turnover > 1e7 ? (s.turnover/1e7).toFixed(1)+" Cr" :
-               s.turnover > 1e5 ? (s.turnover/1e5).toFixed(1)+" L" :
-               fmt(s.turnover);
-  return `<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid #f1f5f9;gap:8px">
-    <div style="display:flex;align-items:center;gap:8px;min-width:0">
-      <span style="font-weight:700;color:#0f172a;font-size:13px">${s.sym}</span>
-      ${inPortfolio ? '<span style="font-size:10px;background:#dbeafe;color:#1d4ed8;padding:1px 6px;border-radius:10px;font-weight:700">P</span>' : ""}
-    </div>
-    <div style="text-align:right;flex-shrink:0">
-      <div style="font-weight:700;color:#0f172a;font-size:13px">Rs. ${fmt(s.ltp)}</div>
-      <div style="font-size:11px;color:#6366f1;font-weight:600">Rs. ${tStr}</div>
-    </div>
-    <button onclick="toggleWatchlist('${s.sym}')" title="Watchlist"
-      style="background:none;border:none;cursor:pointer;font-size:16px;padding:2px;flex-shrink:0">${inWatchlist ? "★" : "☆"}</button>
-  </div>`;
 }
 
 // ── Watchlist ─────────────────────────────────────────────────────────────────
@@ -1145,6 +1208,14 @@ window.confirmImport = async () => {
   .tab-btn{padding:8px 20px;font-family:inherit;font-size:13px;font-weight:600;background:transparent;border:none;color:var(--muted);cursor:pointer;border-radius:9px;transition:all 0.2s}
   .tab-btn.active{background:linear-gradient(135deg,#0ea5e9,#0284c7);color:#fff;box-shadow:0 2px 8px rgba(14,165,233,0.3)}
   .tab-content{display:none}
+
+  /* Live market filter buttons */
+  .live-filter-btn{padding:6px 14px;font-family:inherit;font-size:12px;font-weight:600;border:1.5px solid var(--border);background:#fff;color:var(--muted);border-radius:20px;cursor:pointer;transition:all 0.15s;white-space:nowrap}
+  .live-filter-btn:hover{border-color:var(--primary);color:var(--primary)}
+  .live-filter-btn.active{background:var(--primary);color:#fff;border-color:var(--primary);box-shadow:0 2px 6px rgba(14,165,233,0.3)}
+  .live-th{cursor:pointer;user-select:none;white-space:nowrap}
+  .live-th:hover{color:var(--primary)}
+  .live-th.sorted{color:var(--primary)}
   #tab-holdings{display:block}
 
   /* Toolbar */
@@ -1492,57 +1563,65 @@ window.confirmImport = async () => {
 
     <!-- Live Market Tab -->
     <div class="tab-content" id="tab-live">
-      <!-- Market breadth bar -->
-      <div class="stats-grid" style="margin-bottom:20px">
-        <div class="stat-card">
-          <div class="stat-label">Stocks Loaded</div>
-          <div class="stat-value" style="color:#6366f1;font-size:20px" id="live-count">—</div>
+
+      <!-- Stats bar -->
+      <div style="display:flex;align-items:center;gap:20px;flex-wrap:wrap;margin-bottom:16px;padding:14px 18px;background:#fff;border:1px solid var(--border);border-radius:12px;box-shadow:var(--shadow)">
+        <div>
+          <div style="font-size:11px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.6px">Stocks Loaded</div>
+          <div style="font-size:18px;font-weight:800;color:#6366f1" id="live-count">—</div>
         </div>
-        <div class="stat-card" style="grid-column:span 3">
-          <div class="stat-label">Market Breadth</div>
-          <div class="stat-value" style="font-size:16px;letter-spacing:.5px" id="live-breadth">—</div>
+        <div style="flex:1;min-width:200px">
+          <div style="font-size:11px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.6px">Market Breadth</div>
+          <div style="font-size:14px;font-weight:600;margin-top:2px" id="live-breadth">Click ⟳ Refresh to load</div>
+        </div>
+        <div style="font-size:12px;color:var(--muted)" id="live-result-count"></div>
+      </div>
+
+      <!-- Search + Filter bar -->
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px">
+        <input type="text" placeholder="🔍  Search scrip..." oninput="setLiveSearch(this.value)"
+          style="padding:8px 14px;border:1.5px solid var(--border);border-radius:9px;font-family:inherit;font-size:13px;width:200px;outline:none;color:#0f172a"
+          oninput="this.value=this.value.toUpperCase();setLiveSearch(this.value)"/>
+        <div style="display:flex;gap:4px;flex-wrap:wrap">
+          <button class="live-filter-btn active" data-f="all"       onclick="setLiveFilter('all')">All</button>
+          <button class="live-filter-btn"         data-f="up"        onclick="setLiveFilter('up')">▲ Gainers</button>
+          <button class="live-filter-btn"         data-f="down"      onclick="setLiveFilter('down')">▼ Losers</button>
+          <button class="live-filter-btn"         data-f="portfolio" onclick="setLiveFilter('portfolio')">My Portfolio</button>
+          <button class="live-filter-btn"         data-f="watchlist" onclick="setLiveFilter('watchlist')">⭐ Watchlist</button>
         </div>
       </div>
 
-      <!-- 3-column grid -->
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px">
-
-        <!-- Top Gainers -->
-        <div class="card" style="padding:0;overflow:hidden">
-          <div class="card-title" style="padding:14px 16px;margin:0;border-bottom:1px solid var(--border);background:#f0fdf4;color:#15803d">
-            ▲ Top Gainers
-          </div>
-          <div id="live-gainers">
-            <div style="text-align:center;padding:40px;color:#94a3b8;font-size:13px">
-              <div style="font-size:28px;margin-bottom:8px">📡</div>
-              Click ⟳ Refresh to load live prices
-            </div>
-          </div>
-        </div>
-
-        <!-- Top Losers -->
-        <div class="card" style="padding:0;overflow:hidden">
-          <div class="card-title" style="padding:14px 16px;margin:0;border-bottom:1px solid var(--border);background:#fef2f2;color:#b91c1c">
-            ▼ Top Losers
-          </div>
-          <div id="live-losers">
-            <div style="text-align:center;padding:40px;color:#94a3b8;font-size:13px">—</div>
-          </div>
-        </div>
-
-        <!-- Most Active by Turnover -->
-        <div class="card" style="padding:0;overflow:hidden">
-          <div class="card-title" style="padding:14px 16px;margin:0;border-bottom:1px solid var(--border);background:#f5f3ff;color:#6d28d9">
-            🔥 Most Active
-          </div>
-          <div id="live-active">
-            <div style="text-align:center;padding:40px;color:#94a3b8;font-size:13px">—</div>
-          </div>
-        </div>
-
+      <!-- Empty state -->
+      <div id="live-empty" style="text-align:center;padding:60px;color:#94a3b8">
+        <div style="font-size:40px;margin-bottom:12px">📡</div>
+        <div style="font-size:15px;font-weight:600;margin-bottom:6px">No market data loaded yet</div>
+        <div style="font-size:13px">Click <strong>⟳ Refresh</strong> in the top bar to fetch all NEPSE prices</div>
       </div>
-      <div style="margin-top:14px;font-size:12px;color:var(--muted);text-align:center">
-        ☆ = add to watchlist &nbsp;·&nbsp; P = in your portfolio &nbsp;·&nbsp; W = in your watchlist &nbsp;·&nbsp; Prices auto-update every 5 min
+
+      <!-- Full stock table -->
+      <div id="live-table-wrap" style="display:none">
+        <div class="table-wrap">
+          <table style="font-size:12.5px">
+            <thead>
+              <tr>
+                <th class="live-th" data-col="sym"       onclick="sortLive('sym')"       style="cursor:pointer;white-space:nowrap">Scrip ↕</th>
+                <th class="live-th" data-col="ltp"       onclick="sortLive('ltp')"       style="cursor:pointer;text-align:right">LTP ↕</th>
+                <th class="live-th" data-col="change"    onclick="sortLive('change')"    style="cursor:pointer;text-align:right">Change ↕</th>
+                <th class="live-th" data-col="changePct" onclick="sortLive('changePct')" style="cursor:pointer;text-align:right">% ↕</th>
+                <th style="text-align:right">Open</th>
+                <th style="text-align:right;color:#059669">High</th>
+                <th style="text-align:right;color:#dc2626">Low</th>
+                <th class="live-th" data-col="volume"   onclick="sortLive('volume')"   style="cursor:pointer;text-align:right">Volume ↕</th>
+                <th class="live-th" data-col="turnover" onclick="sortLive('turnover')" style="cursor:pointer;text-align:right">Turnover ↕</th>
+                <th style="text-align:center">★</th>
+              </tr>
+            </thead>
+            <tbody id="live-tbody"></tbody>
+          </table>
+        </div>
+        <div style="margin-top:10px;font-size:11px;color:var(--muted);text-align:center">
+          P = in your portfolio &nbsp;·&nbsp; W = in your watchlist &nbsp;·&nbsp; Click ★ to add/remove from watchlist &nbsp;·&nbsp; Click column headers to sort
+        </div>
       </div>
     </div>
 
