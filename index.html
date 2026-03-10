@@ -204,6 +204,8 @@ async function refreshAllLTPs(silent = false) {
   }
   await saveHoldings();
   renderPortfolio();
+         savePortfolioHistory();
+drawPortfolioChart();
   const now = new Date();
   const timeStr = now.toLocaleTimeString("en-NP", { hour:"2-digit", minute:"2-digit" });
   const el = document.getElementById("last-refresh");
@@ -216,7 +218,7 @@ async function refreshAllLTPs(silent = false) {
   }
 }
 
-function startAutoRefresh() { stopAutoRefresh(); refreshInterval = setInterval(() => refreshAllLTPs(true), 5*60*1000); }
+function startAutoRefresh() { stopAutoRefresh(); refreshInterval = setInterval(() => refreshAllLTPs(true), 2*60*1000); }
 function stopAutoRefresh()  { if (refreshInterval) clearInterval(refreshInterval); }
 
 // ── Auth actions ──────────────────────────────────────────────────────────────
@@ -864,6 +866,8 @@ window.confirmImport = async () => {
     .auth-wrap{grid-template-columns:1fr}
   }
 </style>
+
+         <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
 
