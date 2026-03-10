@@ -142,49 +142,73 @@ async function loadHoldings() {
 
 // ── LTP fetcher — returns { ltp, prevClose } ──────────────────────────────────
 async function fetchLTPData(scrip) {
-  // Source 1: ShareBazaar — has both currentPrice and previousClose
+
+  // Source 1: Official NEPSE API via CORS proxy
   try {
-    const res  = await fetch(`https://nepsetty.kokomo.workers.dev/api?symbol=${scrip}`, { signal: AbortSignal.timeout(8000) });
+    const url = `https://www.nepalstock.com/api/nots/securityDailyTradeStat/${scrip}`;
+    const res  = await fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`, { signal: AbortSignal.timeout(10000) });
     const data = await res.json();
-    if (data && data.currentPrice) {
-      return {
-        ltp:       parseFloat(data.currentPrice),
-        prevClose: parseFloat(data.previousClose || data.currentPrice),
-      };
+    if (data && data.securityDailyTradeDto) {
+      const d = data.securityDailyTradeDto;
+      const ltp = parseFloat(d.lastTradedPrice || d.closingPrice || 0);
+      const prev = parseFloat(d.previousClosingPrice || d.closingPrice || ltp);
+      if (ltp > 0) return { ltp, prevClose: prev };
     }
   } catch(e) {}
-  // Source 2: MeroLagani fallback — has LastTradedPrice and PreviousClose
+
+  // Source 2: MeroLagani via corsproxy
   try {
     const url  = `https://merolagani.com/handlers/webrequesthandler.ashx?type=getCompanyDetail&symbol=${scrip}`;
-    const res  = await fetch(`https://corsproxy.io/?${encodeURIComponent(url)}`, { signal: AbortSignal.timeout(6000) });
+    const res  = await fetch(`https://corsproxy.io/?${encodeURIComponent(url)}`, { signal: AbortSignal.timeout(8000) });
     const data = await res.json();
     if (data && data.LastTradedPrice) {
-      return {
-        ltp:       parseFloat(data.LastTradedPrice.replace(/,/g,"")),
-        prevClose: parseFloat((data.PreviousClose||data.LastTradedPrice).replace(/,/g,"")),
-      };
+      const ltp  = parseFloat(data.LastTradedPrice.toString().replace(/,/g,""));
+      const prev = parseFloat((data.PreviousClose || data.LastTradedPrice).toString().replace(/,/g,""));
+      if (ltp > 0) return { ltp, prevClose: prev };
     }
   } catch(e) {}
+
+  // Source 3: MeroLagani via allorigins
+  try {
+    const url  = `https://merolagani.com/handlers/webrequesthandler.ashx?type=getCompanyDetail&symbol=${scrip}`;
+    const res  = await fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`, { signal: AbortSignal.timeout(8000) });
+    const data = await res.json();
+    if (data && data.LastTradedPrice) {
+      const ltp  = parseFloat(data.LastTradedPrice.toString().replace(/,/g,""));
+      const prev = parseFloat((data.PreviousClose || data.LastTradedPrice).toString().replace(/,/g,""));
+      if (ltp > 0) return { ltp, prevClose: prev };
+    }
+  } catch(e) {}
+
   return null;
 }
 
 async function refreshAllLTPs(silent = false) {
   if (holdings.length === 0) return;
   let updated = 0;
+  let failed  = 0;
   for (let h of holdings) {
     const result = await fetchLTPData(h.scrip);
     if (result) {
       h.ltp       = result.ltp;
       h.prevClose = result.prevClose;
       updated++;
+    } else {
+      failed++;
     }
   }
   await saveHoldings();
   renderPortfolio();
-  // Show last updated time quietly — no "fetching" message
   const now = new Date();
   const timeStr = now.toLocaleTimeString("en-NP", { hour:"2-digit", minute:"2-digit" });
-  document.getElementById("last-refresh").textContent = updated > 0 ? `Prices updated ${timeStr}` : `Last updated ${timeStr}`;
+  const el = document.getElementById("last-refresh");
+  if (updated > 0) {
+    el.textContent = `✓ Prices updated ${timeStr}`;
+    el.style.color = "#059669";
+  } else {
+    el.textContent = `⚠ Could not fetch prices — market may be closed`;
+    el.style.color = "#d97706";
+  }
 }
 
 function startAutoRefresh() { stopAutoRefresh(); refreshInterval = setInterval(() => refreshAllLTPs(true), 5*60*1000); }
