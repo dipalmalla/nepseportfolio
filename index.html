@@ -149,101 +149,151 @@ function fetchWithTimeout(url, ms = 10000, options = {}) {
     .finally(() => clearTimeout(timer));
 }
 
-// ── Bulk LTP fetch — ONE request for ALL stocks ───────────────────────────────
+// ── Bulk LTP fetch — tries multiple sources, returns symbol→data map ──────────
 async function fetchAllLTPs() {
-  // Source 1: nepseapi.surajrimal.dev/LiveMarket — returns all stocks in one call
-  try {
-    const res  = await fetchWithTimeout("https://nepseapi.surajrimal.dev/LiveMarket", 12000, {
-      headers: { "Accept": "application/json" }
-    });
-    if (res.ok) {
-      const data = await res.json();
-      if (Array.isArray(data) && data.length > 0) {
-        const map = {};
-        data.forEach(s => {
-          const sym = (s.symbol || s.scrip || "").toUpperCase();
-          if (!sym) return;
-          map[sym] = {
-            ltp:       parseFloat(s.lastTradedPrice || s.ltp || s.closePrice || 0),
-            prevClose: parseFloat(s.previousClosingPrice || s.previousClose || s.prevClose || s.lastTradedPrice || 0),
-            open:      parseFloat(s.openPrice  || s.open  || 0),
-            high:      parseFloat(s.highPrice  || s.high  || 0),
-            low:       parseFloat(s.lowPrice   || s.low   || 0),
-            volume:    parseFloat(s.totalTradeQuantity || s.volume || s.qty || 0),
-            turnover:  parseFloat(s.totalTurnover || s.turnover || s.amount || 0),
-            trades:    parseFloat(s.totalTrades  || s.trades || 0),
-          };
-        });
-        if (Object.keys(map).length > 0) return map;
-      }
-    }
-  } catch(e) {}
+  const errors = [];
 
-  // Source 2: nepseapi.surajrimal.dev/PriceVolume — alternate bulk endpoint
-  try {
-    const res  = await fetchWithTimeout("https://nepseapi.surajrimal.dev/PriceVolume", 12000, {
-      headers: { "Accept": "application/json" }
+  // Helper: build map from a stock list using flexible field names
+  function buildMap(list, fields) {
+    const map = {};
+    list.forEach(s => {
+      const sym = (s[fields.sym] || "").toString().trim().toUpperCase();
+      if (!sym || sym.length > 12 || /\d{4}/.test(sym)) return;
+      const ltp = parseFloat(s[fields.ltp] || 0);
+      if (ltp <= 0) return;
+      map[sym] = {
+        ltp,
+        prevClose: parseFloat(s[fields.prev] || ltp),
+        open:      parseFloat(s[fields.open] || 0),
+        high:      parseFloat(s[fields.high] || 0),
+        low:       parseFloat(s[fields.low]  || 0),
+        volume:    parseFloat(s[fields.vol]  || 0),
+        turnover:  parseFloat(s[fields.turn] || 0),
+      };
     });
-    if (res.ok) {
-      const data = await res.json();
-      const list = Array.isArray(data) ? data : (data?.data || data?.stocks || []);
-      if (list.length > 0) {
-        const map = {};
-        list.forEach(s => {
-          const sym = (s.symbol || s.scrip || s.stockSymbol || "").toUpperCase();
-          if (!sym) return;
-          map[sym] = {
-            ltp:       parseFloat(s.lastTradedPrice || s.ltp || s.closePrice || s.close || 0),
-            prevClose: parseFloat(s.previousClosingPrice || s.previousClose || s.prevClose || 0) || parseFloat(s.lastTradedPrice || 0),
-            open:      parseFloat(s.openPrice  || s.open  || 0),
-            high:      parseFloat(s.highPrice  || s.high  || 0),
-            low:       parseFloat(s.lowPrice   || s.low   || 0),
-            volume:    parseFloat(s.totalTradeQuantity || s.volume || 0),
-            turnover:  parseFloat(s.totalTurnover || s.turnover || 0),
-            trades:    parseFloat(s.totalTrades  || s.trades || 0),
-          };
-        });
-        if (Object.keys(map).length > 0) return map;
-      }
-    }
-  } catch(e) {}
+    return Object.keys(map).length > 10 ? map : null;
+  }
 
-  // Source 3: Official NEPSE today's price list via allorigins (size=500 gets all stocks)
+  // ── Source 1: MeroLagani handler API (most reliable, direct JSON) ──────────
   try {
-    const url  = "https://www.nepalstock.com/api/nots/nepse-data/todaysprice?size=500&page=0";
-    const res  = await fetchWithTimeout(`https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`, 14000);
-    if (res.ok) {
+    const proxies = [
+      "https://corsproxy.io/?",
+      "https://api.allorigins.win/raw?url=",
+      "https://api.codetabs.com/v1/proxy?quest=",
+    ];
+    const mlUrl = "https://merolagani.com/handlers/webrequesthandler.ashx?type=live_market";
+    for (const proxy of proxies) {
+      try {
+        const res = await fetchWithTimeout(proxy + encodeURIComponent(mlUrl), 12000);
+        if (!res.ok) continue;
+        const data = await res.json();
+        const list = Array.isArray(data) ? data : (data?.d || data?.data || []);
+        if (list.length > 5) {
+          const map = buildMap(list, {
+            sym:"Symbol", ltp:"LTP", prev:"PreviousClose",
+            open:"OpenPrice", high:"HighPrice", low:"LowPrice",
+            vol:"TradedShares", turn:"Turnover",
+          });
+          if (map) return map;
+        }
+      } catch(e) { continue; }
+    }
+  } catch(e) { errors.push("ML:" + e.message); }
+
+  // ── Source 2: nepseapi.surajrimal.dev LiveMarket ───────────────────────────
+  for (const ep of ["LiveMarket","PriceVolume","Summary"]) {
+    try {
+      const res = await fetchWithTimeout(`https://nepseapi.surajrimal.dev/${ep}`, 10000, {
+        headers: { "Accept": "application/json" }
+      });
+      if (!res.ok) continue;
+      const data = await res.json();
+      const list = Array.isArray(data) ? data : (data?.data || data?.stocks || data?.content || []);
+      if (list.length > 5) {
+        const map = buildMap(list, {
+          sym:"symbol", ltp:"lastTradedPrice", prev:"previousClosingPrice",
+          open:"openPrice", high:"highPrice", low:"lowPrice",
+          vol:"totalTradeQuantity", turn:"totalTurnover",
+        });
+        if (map) return map;
+      }
+    } catch(e) { errors.push(`nepseapi/${ep}:` + e.message); }
+  }
+
+  // ── Source 3: Official NEPSE API via multiple CORS proxies ────────────────
+  const nepseUrl = "https://www.nepalstock.com/api/nots/nepse-data/todaysprice?size=500&page=0";
+  for (const proxy of [
+    "https://api.allorigins.win/raw?url=",
+    "https://corsproxy.io/?",
+    "https://api.codetabs.com/v1/proxy?quest=",
+    "https://thingproxy.freeboard.io/fetch/",
+  ]) {
+    try {
+      const res = await fetchWithTimeout(proxy + encodeURIComponent(nepseUrl), 14000);
+      if (!res.ok) continue;
       const data = await res.json();
       const list = data?.content || data?.data || (Array.isArray(data) ? data : []);
-      if (list.length > 0) {
-        const map = {};
-        list.forEach(s => {
-          const sym = (s.symbol || s.scrip || "").toUpperCase();
-          if (!sym || sym.length > 12) return;
-          map[sym] = {
-            ltp:       parseFloat(s.lastTradedPrice  || s.closingPrice || 0),
-            prevClose: parseFloat(s.previousClosingPrice || s.closingPrice || 0),
-            open:      parseFloat(s.openPrice  || 0),
-            high:      parseFloat(s.highPrice  || 0),
-            low:       parseFloat(s.lowPrice   || 0),
-            volume:    parseFloat(s.totalTradeQuantity || s.totalQuantity || 0),
-            turnover:  parseFloat(s.totalTurnover || 0),
-            trades:    parseFloat(s.totalTrades  || 0),
-          };
+      if (list.length > 5) {
+        const map = buildMap(list, {
+          sym:"symbol", ltp:"lastTradedPrice", prev:"previousClosingPrice",
+          open:"openPrice", high:"highPrice", low:"lowPrice",
+          vol:"totalTradeQuantity", turn:"totalTurnover",
         });
-        if (Object.keys(map).length > 0) return map;
+        if (map) return map;
+      }
+    } catch(e) { errors.push("nepalstock+proxy:" + e.message); }
+  }
+
+  // ── Source 4: Sharesansar today-share-price (HTML scrape via proxy) ────────
+  try {
+    const ssUrl = "https://www.sharesansar.com/api/today-share-price";
+    const res = await fetchWithTimeout("https://corsproxy.io/?" + encodeURIComponent(ssUrl), 12000, {
+      headers: { "X-Requested-With":"XMLHttpRequest", "Accept":"application/json" }
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const list = data?.data || (Array.isArray(data) ? data : []);
+      if (list.length > 5) {
+        const map = buildMap(list, {
+          sym:"symbol", ltp:"close", prev:"prev_close",
+          open:"open", high:"high", low:"low",
+          vol:"traded_shares", turn:"amount",
+        });
+        if (map) return map;
       }
     }
-  } catch(e) {}
+  } catch(e) { errors.push("sharesansar:" + e.message); }
 
-  return null; // all sources failed
+  // ── Source 5: MeroLagani per-stock for holdings only (last resort) ─────────
+  // Only runs if we have holdings — fetches just what we need
+  if (holdings.length > 0) {
+    const map = {};
+    let got = 0;
+    for (const h of holdings) {
+      try {
+        const url = `https://merolagani.com/handlers/webrequesthandler.ashx?type=getCompanyDetail&symbol=${h.scrip}`;
+        const res = await fetchWithTimeout("https://corsproxy.io/?" + encodeURIComponent(url), 8000);
+        if (!res.ok) continue;
+        const d = await res.json();
+        if (d?.LastTradedPrice) {
+          const ltp  = parseFloat(d.LastTradedPrice.toString().replace(/,/g,""));
+          const prev = parseFloat((d.PreviousClose||d.LastTradedPrice).toString().replace(/,/g,""));
+          if (ltp > 0) { map[h.scrip] = { ltp, prevClose: prev, open:0,high:0,low:0,volume:0,turnover:0 }; got++; }
+        }
+      } catch(e) {}
+    }
+    if (got > 0) return map;
+  }
+
+  console.warn("All LTP sources failed:", errors);
+  return null;
 }
 
 async function refreshAllLTPs() {
   if (holdings.length === 0) return;
 
   const el = document.getElementById("last-refresh");
-  el.textContent = "Updating prices…";
+  el.textContent = "⟳ Fetching prices…";
   el.style.color = "#64748b";
 
   const map = await fetchAllLTPs();
@@ -251,7 +301,7 @@ async function refreshAllLTPs() {
   const timeStr = now.toLocaleTimeString("en-NP", { hour:"2-digit", minute:"2-digit" });
 
   if (map) {
-    liveMarketData = map; // cache for live dashboard & watchlist
+    liveMarketData = map;
     let updated = 0;
     holdings.forEach(h => {
       const d = map[h.scrip.toUpperCase()];
@@ -265,16 +315,17 @@ async function refreshAllLTPs() {
     renderPortfolio();
     renderLiveDashboard();
     renderWatchlist();
+    const total = Object.keys(map).length;
     if (updated > 0) {
-      el.textContent = `✓ Prices updated ${timeStr}`;
+      el.textContent = `✓ Updated ${updated}/${holdings.length} stocks · ${total > 50 ? total+" market stocks" : ""} · ${timeStr}`;
       el.style.color = "#059669";
     } else {
-      el.textContent = `Last updated ${timeStr} (market closed)`;
+      el.textContent = `✓ Market data loaded (${total} stocks) · ${timeStr} — your scrips may not have traded today`;
       el.style.color = "#d97706";
     }
   } else {
     renderPortfolio();
-    el.textContent = `⚠ Could not fetch prices — showing saved data`;
+    el.textContent = `⚠ All price sources failed · ${timeStr} — check console for details`;
     el.style.color = "#dc2626";
   }
 }
