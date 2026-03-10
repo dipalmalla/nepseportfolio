@@ -98,6 +98,7 @@ async function saveHoldings() {
     qty:       Number(h.qty)       || 0,
     buyPrice:  Number(h.buyPrice)  || 0,
     ltp:       Number(h.ltp)       || 0,
+    prevClose: Number(h.prevClose) || 0,
     sector:    h.sector    || "Others",
   }));
   // Always save to localStorage as a reliable backup
@@ -139,49 +140,54 @@ async function loadHoldings() {
   renderPortfolio();
 }
 
-// ── LTP fetcher ───────────────────────────────────────────────────────────────
-async function fetchLTP(scrip) {
+// ── LTP fetcher — returns { ltp, prevClose } ──────────────────────────────────
+async function fetchLTPData(scrip) {
+  // Source 1: ShareBazaar — has both currentPrice and previousClose
   try {
     const res  = await fetch(`https://nepsetty.kokomo.workers.dev/api?symbol=${scrip}`, { signal: AbortSignal.timeout(8000) });
     const data = await res.json();
-    if (data && data.currentPrice) return parseFloat(data.currentPrice);
+    if (data && data.currentPrice) {
+      return {
+        ltp:       parseFloat(data.currentPrice),
+        prevClose: parseFloat(data.previousClose || data.currentPrice),
+      };
+    }
   } catch(e) {}
-  try {
-    const url  = `https://nepsealpha.com/trading/1/history?symbol=${scrip}&resolution=1D&from=${Math.floor(Date.now()/1000)-86400}&to=${Math.floor(Date.now()/1000)}`;
-    const res  = await fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`, { signal: AbortSignal.timeout(6000) });
-    const data = await res.json();
-    if (data && data.c && data.c.length > 0) return parseFloat(data.c[data.c.length - 1]);
-  } catch(e) {}
+  // Source 2: MeroLagani fallback — has LastTradedPrice and PreviousClose
   try {
     const url  = `https://merolagani.com/handlers/webrequesthandler.ashx?type=getCompanyDetail&symbol=${scrip}`;
     const res  = await fetch(`https://corsproxy.io/?${encodeURIComponent(url)}`, { signal: AbortSignal.timeout(6000) });
     const data = await res.json();
-    if (data && data.LastTradedPrice) return parseFloat(data.LastTradedPrice.replace(/,/g,""));
+    if (data && data.LastTradedPrice) {
+      return {
+        ltp:       parseFloat(data.LastTradedPrice.replace(/,/g,"")),
+        prevClose: parseFloat((data.PreviousClose||data.LastTradedPrice).replace(/,/g,"")),
+      };
+    }
   } catch(e) {}
   return null;
 }
 
-async function refreshAllLTPs() {
+async function refreshAllLTPs(silent = false) {
   if (holdings.length === 0) return;
-  setStatus("Fetching live prices…", "blue");
   let updated = 0;
   for (let h of holdings) {
-    const ltp = await fetchLTP(h.scrip);
-    if (ltp) { h.ltp = ltp; updated++; }
+    const result = await fetchLTPData(h.scrip);
+    if (result) {
+      h.ltp       = result.ltp;
+      h.prevClose = result.prevClose;
+      updated++;
+    }
   }
-  // Always save after refresh so LTPs persist across logout
   await saveHoldings();
-  setStatus(
-    updated > 0
-      ? `✓ ${updated}/${holdings.length} prices updated`
-      : "⚠ Market closed — showing last known prices",
-    updated > 0 ? "green" : "amber"
-  );
   renderPortfolio();
-  document.getElementById("last-refresh").textContent = "Updated " + new Date().toLocaleTimeString();
+  // Show last updated time quietly — no "fetching" message
+  const now = new Date();
+  const timeStr = now.toLocaleTimeString("en-NP", { hour:"2-digit", minute:"2-digit" });
+  document.getElementById("last-refresh").textContent = updated > 0 ? `Prices updated ${timeStr}` : `Last updated ${timeStr}`;
 }
 
-function startAutoRefresh() { stopAutoRefresh(); refreshInterval = setInterval(refreshAllLTPs, 5*60*1000); }
+function startAutoRefresh() { stopAutoRefresh(); refreshInterval = setInterval(() => refreshAllLTPs(true), 5*60*1000); }
 function stopAutoRefresh()  { if (refreshInterval) clearInterval(refreshInterval); }
 
 // ── Auth actions ──────────────────────────────────────────────────────────────
@@ -233,6 +239,13 @@ window.switchMode = (mode) => {
   document.getElementById("auth-title").textContent     = mode === "login" ? "Welcome back 👋" : "Start tracking today 🚀";
   document.getElementById("auth-subtitle").textContent  = mode === "login" ? "Login to view your portfolio" : "Free forever — no credit card needed";
   clearAuthMsg();
+};
+
+window.togglePass = (inputId, btnId) => {
+  const input = document.getElementById(inputId);
+  const btn   = document.getElementById(btnId);
+  if (input.type === "password") { input.type = "text";     btn.textContent = "🙈"; }
+  else                           { input.type = "password"; btn.textContent = "👁";  }
 };
 
 window.handleAuthSubmit = () => { authMode === "login" ? doLogin() : doRegister(); };
@@ -304,10 +317,9 @@ window.saveHolding = async () => {
   }
   closeModal();
   if (!manualLTP) {
-    setStatus("Fetching price for " + scrip + "…", "blue");
-    const ltp = await fetchLTP(scrip);
-    const h   = holdings.find(x => x.scrip === scrip);
-    if (ltp && h) h.ltp = ltp;
+    const result = await fetchLTPData(scrip);
+    const h = holdings.find(x => x.scrip === scrip);
+    if (result && h) { h.ltp = result.ltp; h.prevClose = result.prevClose; }
   }
   await saveHoldings();
   renderPortfolio();
@@ -323,42 +335,42 @@ window.deleteHolding = async (idx) => {
 
 // ── Render ────────────────────────────────────────────────────────────────────
 function renderPortfolio() {
-  const totalValue   = holdings.reduce((s,h) => s + h.qty*(h.ltp||0), 0);
-  const totalCost    = holdings.reduce((s,h) => s + h.qty*(h.buyPrice||0), 0);
-  const totalGain    = totalValue - totalCost;
-  const totalGainPct = totalCost > 0 ? (totalGain/totalCost*100) : 0;
+  const totalValue    = holdings.reduce((s,h) => s + h.qty*(h.ltp||0), 0);
+  const totalPrevVal  = holdings.reduce((s,h) => s + h.qty*(h.prevClose||h.ltp||0), 0);
+  const totalDayGain  = totalValue - totalPrevVal;
+  const totalDayGainPct = totalPrevVal > 0 ? (totalDayGain/totalPrevVal*100) : 0;
 
   document.getElementById("stat-value").textContent    = "Rs. " + fmt(totalValue);
-  document.getElementById("stat-cost").textContent     = "Rs. " + fmt(totalCost);
-  document.getElementById("stat-gain").textContent     = (totalGain>=0?"+":"") + "Rs. " + fmt(Math.abs(totalGain));
-  document.getElementById("stat-gainpct").textContent  = (totalGainPct>=0?"+":"") + totalGainPct.toFixed(2) + "%";
-  document.getElementById("stat-gain").style.color     = totalGain >= 0 ? "#059669" : "#dc2626";
-  document.getElementById("stat-gainpct").style.color  = totalGainPct >= 0 ? "#059669" : "#dc2626";
+  document.getElementById("stat-gain").textContent     = (totalDayGain>=0?"+":"") + "Rs. " + fmt(Math.abs(totalDayGain));
+  document.getElementById("stat-gainpct").textContent  = (totalDayGainPct>=0?"+":"") + totalDayGainPct.toFixed(2) + "%";
+  document.getElementById("stat-gain").style.color     = totalDayGain >= 0 ? "#059669" : "#dc2626";
+  document.getElementById("stat-gainpct").style.color  = totalDayGainPct >= 0 ? "#059669" : "#dc2626";
   document.getElementById("stat-holdings").textContent = holdings.length + " stocks";
 
   const tbody = document.getElementById("holdings-tbody");
   tbody.innerHTML = "";
   if (holdings.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="11" style="text-align:center;padding:48px;color:#94a3b8">
+    tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;padding:48px;color:#94a3b8">
       <div style="font-size:32px;margin-bottom:8px">📭</div>
       No holdings yet. Click "+ Add Holding" or import from Meroshare to get started.
     </td></tr>`;
   } else {
     [...holdings].sort((a,b)=>b.qty*(b.ltp||0)-a.qty*(a.ltp||0)).forEach(h => {
-      const value   = h.qty*(h.ltp||0);
-      const cost    = h.qty*(h.buyPrice||0);
-      const gain    = cost > 0 ? value-cost : null;
-      const gainPct = cost > 0 ? (value-cost)/cost*100 : null;
-      const pct     = totalValue > 0 ? (value/totalValue*100) : 0;
-      const verdict = getVerdict(h.scrip, gainPct||0);
-      const origIdx = holdings.indexOf(h);
+      const ltp       = h.ltp      || 0;
+      const prevClose = h.prevClose || ltp;
+      const value     = h.qty * ltp;
+      const pct       = totalValue > 0 ? (value/totalValue*100) : 0;
+      // Day gain/loss: today's price vs yesterday's close
+      const dayGain    = prevClose > 0 ? (ltp - prevClose) * h.qty : null;
+      const dayGainPct = prevClose > 0 ? ((ltp - prevClose)/prevClose*100) : null;
+      const verdict    = getVerdict(h.scrip, dayGainPct||0);
+      const origIdx    = holdings.indexOf(h);
       const tr = document.createElement("tr");
       tr.innerHTML = `
         <td><span class="scrip-badge">${h.scrip}</span></td>
         <td class="text-muted small">${h.sector}</td>
         <td>${h.qty.toLocaleString()}</td>
-        <td>${h.buyPrice ? "Rs. "+h.buyPrice.toLocaleString() : "—"}</td>
-        <td class="text-dark fw-600">${h.ltp ? "Rs. "+h.ltp.toLocaleString() : "—"}</td>
+        <td class="text-dark fw-600">${ltp ? "Rs. "+ltp.toLocaleString() : "—"}</td>
         <td class="fw-700">Rs. ${fmt(value)}</td>
         <td>
           <div style="display:flex;align-items:center;gap:6px">
@@ -368,11 +380,9 @@ function renderPortfolio() {
             <span class="small" style="color:#64748b;min-width:32px">${pct.toFixed(1)}%</span>
           </div>
         </td>
-        <td style="color:${gain===null?"#94a3b8":gain>=0?"#059669":"#dc2626"}">
-          ${gain===null?"—":(gain>=0?"+":"")+"Rs. "+fmt(Math.abs(gain))}
-        </td>
-        <td style="color:${gainPct===null?"#94a3b8":gainPct>=0?"#059669":"#dc2626"}">
-          ${gainPct===null?"—":(gainPct>=0?"+":"")+gainPct.toFixed(2)+"%"}
+        <td style="color:${dayGain===null?"#94a3b8":dayGain>=0?"#059669":"#dc2626"}">
+          ${dayGain===null?"—":(dayGain>=0?"+":"")+"Rs. "+fmt(Math.abs(dayGain))}
+          ${dayGainPct!==null?`<span style="font-size:11px;margin-left:4px">(${dayGainPct>=0?"+":""}${dayGainPct.toFixed(2)}%)</span>`:""}
         </td>
         <td><span class="verdict-badge" style="background:${verdict.bg};color:${verdict.color};border:1px solid ${verdict.border}">${verdict.label}</span></td>
         <td>
@@ -920,12 +930,18 @@ window.confirmImport = async () => {
       <input id="auth-email" class="auth-input" type="email" placeholder="you@example.com"/>
 
       <label class="auth-label">Password</label>
-      <input id="auth-pass" class="auth-input" type="password" placeholder="Enter your password"
-        onkeydown="if(event.key==='Enter') handleAuthSubmit()"/>
+      <div style="position:relative">
+        <input id="auth-pass" class="auth-input" type="password" placeholder="Enter your password"
+          onkeydown="if(event.key==='Enter') handleAuthSubmit()" style="padding-right:42px"/>
+        <button type="button" onclick="togglePass('auth-pass','eye1')" style="position:absolute;right:12px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;color:#94a3b8;font-size:16px;padding:0;line-height:1" id="eye1">👁</button>
+      </div>
 
-      <div id="auth-pass2-group" style="display:none">
+      <div id="auth-pass2-group" style="display:none;margin-top:14px">
         <label class="auth-label">Confirm Password</label>
-        <input id="auth-pass2" class="auth-input" type="password" placeholder="Re-enter your password"/>
+        <div style="position:relative">
+          <input id="auth-pass2" class="auth-input" type="password" placeholder="Re-enter your password" style="padding-right:42px"/>
+          <button type="button" onclick="togglePass('auth-pass2','eye2')" style="position:absolute;right:12px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;color:#94a3b8;font-size:16px;padding:0;line-height:1" id="eye2">👁</button>
+        </div>
       </div>
 
       <div id="forgot-link" class="forgot-link">
@@ -950,8 +966,8 @@ window.confirmImport = async () => {
       <span class="topbar-logo-text">NEPSE Portfolio Tracker</span>
     </div>
     <div class="topbar-right">
-      <span id="status-msg" class="status-pill status-blue">Loading…</span>
       <span id="last-refresh" class="last-rt"></span>
+      <span id="status-msg" style="display:none"></span>
       <button class="tb-btn" onclick="manualRefresh()">⟳ Refresh</button>
       <span style="font-size:12px;color:var(--muted)" id="user-email"></span>
       <button class="tb-btn tb-btn-danger" onclick="doLogout()">Logout</button>
@@ -967,15 +983,11 @@ window.confirmImport = async () => {
         <div class="stat-value" id="stat-value">Rs. 0</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">Total Invested</div>
-        <div class="stat-value" style="color:#475569" id="stat-cost">Rs. 0</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label">Gain / Loss</div>
+        <div class="stat-label">Today's Gain / Loss</div>
         <div class="stat-value" id="stat-gain">Rs. 0</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">Overall Return</div>
+        <div class="stat-label">Today's Change</div>
         <div class="stat-value" id="stat-gainpct">0.00%</div>
       </div>
       <div class="stat-card">
@@ -1004,9 +1016,9 @@ window.confirmImport = async () => {
         <table>
           <thead>
             <tr>
-              <th>Scrip</th><th>Sector</th><th>Qty</th><th>Buy Price</th>
+              <th>Scrip</th><th>Sector</th><th>Qty</th>
               <th>LTP</th><th>Value</th><th>Weight</th>
-              <th>Gain/Loss</th><th>Return %</th><th>Signal</th><th>Actions</th>
+              <th>Day Gain / Loss</th><th>Signal</th><th>Actions</th>
             </tr>
           </thead>
           <tbody id="holdings-tbody"></tbody>
