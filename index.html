@@ -174,7 +174,25 @@ async function fetchAllLTPs() {
     return Object.keys(map).length > 10 ? map : null;
   }
 
-  // ── Source 1: MeroLagani handler API (most reliable, direct JSON) ──────────
+  // ── Source 1: OUR OWN Vercel serverless proxy (same-origin, no CORS ever) ──
+  // /api/prices.js fetches MeroLagani server-side — most reliable source
+  try {
+    const res = await fetchWithTimeout("/api/prices", 10000);
+    if (res.ok) {
+      const data = await res.json();
+      const list = Array.isArray(data) ? data : (data?.d || data?.data || []);
+      if (list.length > 10) {
+        const map = buildMap(list, {
+          sym:"Symbol", ltp:"LTP", prev:"PreviousClose",
+          open:"OpenPrice", high:"HighPrice", low:"LowPrice",
+          vol:"TradedShares", turn:"Turnover",
+        });
+        if (map) { console.log("✅ Prices from /api/prices (Vercel proxy)"); return map; }
+      }
+    }
+  } catch(e) { errors.push("vercel-proxy:" + e.message); }
+
+  // ── Source 2: MeroLagani direct via CORS proxies (fallback) ────────────────
   try {
     const proxies = [
       "https://corsproxy.io/?",
@@ -194,13 +212,13 @@ async function fetchAllLTPs() {
             open:"OpenPrice", high:"HighPrice", low:"LowPrice",
             vol:"TradedShares", turn:"Turnover",
           });
-          if (map) return map;
+          if (map) { console.log("✅ Prices from MeroLagani via proxy"); return map; }
         }
       } catch(e) { continue; }
     }
-  } catch(e) { errors.push("ML:" + e.message); }
+  } catch(e) { errors.push("ML-proxy:" + e.message); }
 
-  // ── Source 2: nepseapi.surajrimal.dev LiveMarket ───────────────────────────
+  // ── Source 3: nepseapi.surajrimal.dev ─────────────────────────────────────
   for (const ep of ["LiveMarket","PriceVolume","Summary"]) {
     try {
       const res = await fetchWithTimeout(`https://nepseapi.surajrimal.dev/${ep}`, 10000, {
@@ -215,12 +233,12 @@ async function fetchAllLTPs() {
           open:"openPrice", high:"highPrice", low:"lowPrice",
           vol:"totalTradeQuantity", turn:"totalTurnover",
         });
-        if (map) return map;
+        if (map) { console.log(`✅ Prices from nepseapi/${ep}`); return map; }
       }
     } catch(e) { errors.push(`nepseapi/${ep}:` + e.message); }
   }
 
-  // ── Source 3: Official NEPSE API via multiple CORS proxies ────────────────
+  // ── Source 4: Official NEPSE API via CORS proxies ─────────────────────────
   const nepseUrl = "https://www.nepalstock.com/api/nots/nepse-data/todaysprice?size=500&page=0";
   for (const proxy of [
     "https://api.allorigins.win/raw?url=",
@@ -239,33 +257,12 @@ async function fetchAllLTPs() {
           open:"openPrice", high:"highPrice", low:"lowPrice",
           vol:"totalTradeQuantity", turn:"totalTurnover",
         });
-        if (map) return map;
+        if (map) { console.log("✅ Prices from NEPSE via proxy"); return map; }
       }
     } catch(e) { errors.push("nepalstock+proxy:" + e.message); }
   }
 
-  // ── Source 4: Sharesansar today-share-price (HTML scrape via proxy) ────────
-  try {
-    const ssUrl = "https://www.sharesansar.com/api/today-share-price";
-    const res = await fetchWithTimeout("https://corsproxy.io/?" + encodeURIComponent(ssUrl), 12000, {
-      headers: { "X-Requested-With":"XMLHttpRequest", "Accept":"application/json" }
-    });
-    if (res.ok) {
-      const data = await res.json();
-      const list = data?.data || (Array.isArray(data) ? data : []);
-      if (list.length > 5) {
-        const map = buildMap(list, {
-          sym:"symbol", ltp:"close", prev:"prev_close",
-          open:"open", high:"high", low:"low",
-          vol:"traded_shares", turn:"amount",
-        });
-        if (map) return map;
-      }
-    }
-  } catch(e) { errors.push("sharesansar:" + e.message); }
-
   // ── Source 5: MeroLagani per-stock for holdings only (last resort) ─────────
-  // Only runs if we have holdings — fetches just what we need
   if (holdings.length > 0) {
     const map = {};
     let got = 0;
@@ -282,7 +279,7 @@ async function fetchAllLTPs() {
         }
       } catch(e) {}
     }
-    if (got > 0) return map;
+    if (got > 0) { console.log("✅ Prices from ML per-stock fallback"); return map; }
   }
 
   console.warn("All LTP sources failed:", errors);
